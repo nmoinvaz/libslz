@@ -27,7 +27,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+#  include <fcntl.h>
+#  include <io.h>
+#  define SET_BINARY_MODE(file) setmode(fileno(file), O_BINARY)
+#else
+#  define SET_BINARY_MODE(file)
+#endif
 
 static uint32_t queue;
 static uint32_t qbits; /* number of bits in queue, < 16 */
@@ -103,6 +113,8 @@ void next_boundary()
 
 	advance_queue(qbits & 7);
 }
+
+#define trace(fmt, ...) fprintf(stderr, fmt, __VA_ARGS__)
 
 /* reads next code, returns the code or -1 when end is reached */
 int get_huff_code()
@@ -191,6 +203,9 @@ int main(void)
 	int code = 0;
 	int ofs = 0;
 
+    SET_BINARY_MODE(stdin);
+    SET_BINARY_MODE(stdout);
+
 	getchar(); // ID1
 	getchar(); // ID2
 	getchar(); // CM
@@ -200,29 +215,29 @@ int main(void)
 	getchar(); // OS
 
 	while (!bfinal) {
-		printf("@0x%04x_%d: ", get_pos(), get_bit());
+		trace("@0x%04x_%d: ", get_pos(), get_bit());
 		bfinal = get_bfinal();
 		btype = get_btype();
-		printf("BTYPE = %1x BFINAL = %d\n", btype, bfinal);
+		trace("BTYPE = %1x BFINAL = %d\n", btype, bfinal);
 
 		switch (btype) {
 		case 0: /* no compression : <boundary> LEN16 | NLEN16 | LEN bytes */
-			printf("  no compression <not implemented>\n");
+			trace("  no compression <not implemented>\n");
 			exit(1);
 			break;
 		case 1:
-			printf("  compressed with huffman\n");
+			trace("  compressed with huffman\n");
 			while (1) {
-				printf("    @z: 0x%04x_%d @raw: %d [0x%06x]: ", get_pos(), get_bit(), ofs, queue);
+				trace("    @z: 0x%04x_%d @raw: %d [0x%06x]: ", get_pos(), get_bit(), ofs, queue);
 				code = get_huff_code();
-				printf("code = %3d", code);
+				trace("code = %3d", code);
 				if (code < 0) {
 					putchar('\n');
 					exit(1);
 				}
 
 				if (code == 256) {
-					printf("=> EOB\n");
+					trace("=> EOB\n");
 					break;
 				}
 
@@ -238,7 +253,7 @@ int main(void)
 						xbits = 0;
 					data = get_bits(xbits);
 					len = get_len(code, data);
-					printf (" => ref: xbits=%d [%d] len=%d", xbits, data, len);
+					trace (" => ref: xbits=%d [%d] len=%d", xbits, data, len);
 					ofs += len;
 
 					code = get_bits(5);  // 5 bits
@@ -248,20 +263,20 @@ int main(void)
 					if (xbits < 0)
 						xbits = 0;
 					data = get_bits(xbits);
-					printf (" code=%d xbits=%d [%d] dist=%d\n", code, xbits, data, get_dist(code, data));
+					trace (" code=%d xbits=%d [%d] dist=%d\n", code, xbits, data, get_dist(code, data));
 				}
 				else {
 					ofs++;
-					printf(" (0x%03x)\n", code);
+					trace(" (0x%03x)\n", code);
 				}
 			}
 			break;
 		case 2:
-			printf("  compressed with dynamic huffman <not implemented>\n");
+			trace("  compressed with dynamic huffman <not implemented>\n");
 			exit(1);
 			break;
 		case 3:
-			printf("  reserved <not implemented>\n");
+			trace("  reserved <not implemented>\n");
 			exit(1);
 			break;
 		}

@@ -29,21 +29,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#include <basetsd.h>
+#else
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/user.h>
+#endif
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include "slz.h"
 
-/* some platforms do not provide PAGE_SIZE */
-#ifndef PAGE_SIZE
-#define PAGE_SIZE sysconf(_SC_PAGESIZE)
+#ifdef _WIN32
+#define isatty _isatty
+#define open _open
+#define ssize_t SSIZE_T
+#define off_t SSIZE_T
+#define NORETURN
+#else
+#define NORETURN __attribute__((noreturn))
+#endif
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+#  define SET_BINARY_MODE(file) setmode(fileno(file), O_BINARY)
+#else
+#  define SET_BINARY_MODE(file)
 #endif
 
 /* display the message and exit with the code */
-__attribute__((noreturn)) void die(int code, const char *format, ...)
+NORETURN void die(int code, const char *format, ...)
 {
         va_list args;
 
@@ -53,7 +69,7 @@ __attribute__((noreturn)) void die(int code, const char *format, ...)
         exit(code);
 }
 
-__attribute__((noreturn)) void usage(const char *name, int code)
+NORETURN void usage(const char *name, int code)
 {
 	die(code,
 	    "Usage: %s [option]* [file]\n"
@@ -90,14 +106,11 @@ int main(int argc, char **argv)
 	unsigned char *outbuf;
 	unsigned char *buffer;
 	off_t toread = -1;
-	off_t tocompress = 0;
-	off_t ofs;
 	size_t outblen;
 	size_t outbsize;
 	size_t block_size;
-	size_t mapsize = 0;
-	unsigned long long totin = 0;
-	unsigned long long totout = 0;
+	off_t totin = 0;
+	off_t totout = 0;
 	int loops = 1;
 	int console = 1;
 	int level   = 3;
@@ -107,6 +120,9 @@ int main(int argc, char **argv)
 	int force   = 0;
 	int fd = 0;
 	int error = 0;
+
+    SET_BINARY_MODE(stdin);
+    SET_BINARY_MODE(stdout);
 
 	argv++;
 	argc--;
@@ -169,7 +185,7 @@ int main(int argc, char **argv)
 	}
 
 	if (argc > 0) {
-		fd = open(argv[0], O_RDONLY);
+		fd = open(argv[0], _O_RDONLY | _O_BINARY);
 		if (fd == -1) {
 			perror("open()");
 			exit(1);
@@ -206,96 +222,35 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 		toread = instat.st_size;
-
-#if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
-		/* attempt to optimize the pipe size if needed and possible */
-		if (S_ISFIFO(instat.st_mode)) {
-			int size = fcntl(fd, F_GETPIPE_SZ);
-			if (size > 0 && size < block_size)
-				fcntl(fd, F_SETPIPE_SZ, block_size);
-		}
-#endif
 	}
 
-	if (toread) {
-		/* we know the size to map, let's do it */
-		mapsize = (toread + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-		buffer = mmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
-		if (buffer == MAP_FAILED)
-			mapsize = 0;
-	}
-
-	if (!mapsize) {
-		/* no mmap() done, read the size of a default block */
-		mapsize = block_size;
-		if (toread && toread < mapsize)
-			mapsize = toread;
-
-		buffer = calloc(1, mapsize);
-		if (!buffer) {
-			perror("calloc");
-			exit(1);
-		}
-
-		if (toread && toread <= mapsize) {
-			/* file-at-once, read it now */
-			toread = read(fd, buffer, toread);
-			if (toread < 0) {
-				perror("read");
-				exit(2);
-			}
-		}
-
-		if (loops > 1 && !toread) {
-			loops = 1;
-			fprintf(stderr, "Warning: disabling loops on non-regular file\n");
-		}
+	buffer = calloc(1, block_size);
+	if (!buffer) {
+		perror("calloc");
+		exit(1);
 	}
 
 	while (loops--) {
 		slz_init(&strm, !!level, format);
-
-		outblen = ofs = 0;
+		size_t count = block_size;
+		int more = 1;
+		outblen = 0;
 		do {
-			int more = !toread || (toread - ofs) > block_size;
-			unsigned char *start;
-
-			if (toread && toread <= mapsize) {
-				/* We use the memory-mapped file so the next
-				 * block starts at the buffer + file offset. We
-				 * read by blocks of <block_size> bytes at one
-				 * except the last one.
-				 */
-				tocompress = more ? block_size : toread - ofs;
-				start = buffer + ofs;
+			if (toread < (uint32_t)block_size) {
+				count = (size_t)toread;
+				more = 0;
 			}
-			else {
-				/* we'll try to fill at least half a buffer with
-				 * input data, it ensures we compress reasonably
-				 * well without having to wait too much for the
-				 * sender when it's a pipe.
-				 */
-				ssize_t ret;
-				tocompress = 0;
 
-				do {
-					ret = read(fd, buffer + tocompress, more ? block_size - tocompress : toread - ofs - tocompress);
-					if (ret <= 0) {
-						if (ret < 0) {
-							perror("read");
-							exit(2);
-						}
-						break;
-					}
-					tocompress += ret;
-				} while (tocompress < block_size / 3);
-
-				if (!tocompress) // done
-					break;
-
-				start = buffer;
+			ssize_t ret = read(fd, buffer, count);
+			if (ret < 0) {
+				perror("read");
+				exit(2);
 			}
-			outblen += slz_encode(&strm, outbuf + outblen, start, tocompress, more);
+
+			toread -= ret;
+			totin += ret;
+
+			outblen += slz_encode(&strm, outbuf + outblen, buffer, ret, more);
 			if (outblen + block_size > outbsize) {
 				/* not enough space left, need to flush */
 				if (console && !test && !error)
@@ -304,20 +259,13 @@ int main(int argc, char **argv)
 				totout += outblen;
 				outblen = 0;
 			}
-			ofs += tocompress;
-		} while (!toread || ofs < toread);
+		} while (more);
 
 		outblen += slz_finish(&strm, outbuf + outblen);
-		totin += ofs;
 		totout += outblen;
 		if (console && !test && !error)
 			if (write(1, outbuf, outblen) < 0)
 				error = 1;
-
-		if (loops && (!toread || toread > mapsize)) {
-			/* this is a seeked file, let's rewind it now */
-			lseek(fd, 0, SEEK_SET);
-		}
 	}
 	if (verbose)
 		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x\n",
